@@ -42,6 +42,7 @@ if (length(missing_packages) > 0) {
 
 rsv_hub_repo <- "../rsv-forecast-hub"  # path to the local rsv-forecast-hub clone
 hub_remote   <- "upstream"             # remote to pull from before processing
+hub_remote_url <- "https://github.com/CDCgov/rsv-forecast-hub.git"
 hub_branch   <- "main"
 
 microhub_repo <- "../microhub"  # used only to reuse microhub's upload validators
@@ -55,14 +56,22 @@ boundary_shapefile <- "raw-data/us-geography/us-state-boundaries.shp"
 # "District of Columbia"); `stusab` holds two-letter abbreviations instead.
 boundary_name_col <- "name"
 
+# Both latest files use the same fully observed starting window. Dated
+# snapshots retain all earlier observations (but omit rows with no value).
+latest_start_date <- as.Date("2024-10-12")
+
 # One output set per target. `slug` names the files; `label` is for console
 # messages; `data_type` is what microhub should be told the values are, and is
 # used both for validation here and for the Data Type radio in the app.
+# `latest_start_date` limits only the undated latest file; dated snapshots
+# preserve the full observed history available in the selected hub snapshot.
 rsv_targets <- list(
   list(target = "wk inc rsv hosp",           slug = "rsv-hosp",
-       label = "Hospitalizations", data_type = "count"),
+       label = "Hospitalizations", data_type = "count",
+       latest_start_date = latest_start_date),
   list(target = "wk inc rsv prop ed visits", slug = "rsv-ed-visits",
-       label = "ED Visits (proportion)", data_type = "proportion")
+       label = "ED Visits (proportion)", data_type = "proportion",
+       latest_start_date = latest_start_date)
 )
 
 # target-data/time-series.parquet is a stack of historical snapshots (one per
@@ -118,7 +127,7 @@ output_dir <- "processed-data"
 
 # Step 1: update the local hub clone ==========================================
 
-pull_hub_repo <- function(repo_path, remote, branch) {
+pull_hub_repo <- function(repo_path, remote, remote_url, branch) {
   repo_path <- normalizePath(repo_path, mustWork = FALSE)
 
   if (!dir.exists(file.path(repo_path, ".git"))) {
@@ -129,36 +138,74 @@ pull_hub_repo <- function(repo_path, remote, branch) {
     )
   }
 
+  configured_url <- system2(
+    "git", c("-C", repo_path, "remote", "get-url", remote),
+    stdout = TRUE, stderr = TRUE
+  )
+  remote_exists <- is.null(attr(configured_url, "status"))
+
+  if (!remote_exists) {
+    message("Adding git remote '", remote, "' -> ", remote_url)
+    remote_output <- system2(
+      "git", c("-C", repo_path, "remote", "add", remote, remote_url),
+      stdout = TRUE, stderr = TRUE
+    )
+  } else if (!identical(sub("\\.git/?$", "", configured_url[[1]]),
+                        sub("\\.git/?$", "", remote_url))) {
+    message(
+      "Correcting git remote '", remote, "' from ", configured_url[[1]],
+      " to ", remote_url
+    )
+    remote_output <- system2(
+      "git", c("-C", repo_path, "remote", "set-url", remote, remote_url),
+      stdout = TRUE, stderr = TRUE
+    )
+  } else {
+    remote_output <- character(0)
+  }
+
+  remote_status <- attr(remote_output, "status")
+  if (!is.null(remote_status) && remote_status != 0) {
+    stop(
+      "Couldn't configure git remote '", remote, "' as ", remote_url, ":\n",
+      paste(remote_output, collapse = "\n"),
+      call. = FALSE
+    )
+  }
+
   local_changes <- system2(
     "git", c("-C", repo_path, "status", "--porcelain"),
     stdout = TRUE, stderr = TRUE
   )
 
   if (length(local_changes) > 0) {
-    message(
-      "'", repo_path, "' has uncommitted changes -- skipping `git pull` so ",
-      "nothing gets clobbered. Commit or stash your changes and re-run this ",
-      "script to pick up hub updates."
+    stop(
+      "'", repo_path, "' has uncommitted changes, so it can't be updated ",
+      "safely. Commit or stash them and re-run this script. Refusing to ",
+      "continue with potentially stale target data.",
+      call. = FALSE
     )
-    return(invisible(FALSE))
   }
 
   message("Pulling ", remote, "/", branch, " into ", repo_path, " ...")
   pull_output <- system2(
-    "git", c("-C", repo_path, "pull", remote, branch),
+    "git", c("-C", repo_path, "pull", "--ff-only", remote, branch),
     stdout = TRUE, stderr = TRUE
   )
   status <- attr(pull_output, "status")
   message(paste(pull_output, collapse = "\n"))
 
   if (!is.null(status) && status != 0) {
-    stop("`git pull ", remote, " ", branch, "` failed in ", repo_path, call. = FALSE)
+    stop(
+      "`git pull --ff-only ", remote, " ", branch, "` failed in ",
+      repo_path, call. = FALSE
+    )
   }
 
   invisible(TRUE)
 }
 
-pull_hub_repo(rsv_hub_repo, hub_remote, hub_branch)
+pull_hub_repo(rsv_hub_repo, hub_remote, hub_remote_url, hub_branch)
 
 # Step 2: load the hub's target data and resolve the as_of snapshot ==========
 
@@ -382,11 +429,11 @@ report_validation <- function(label, kind, result) {
   invisible(NULL)
 }
 
-write_pair <- function(df, slug_suffix, spec) {
+write_pair <- function(df, slug_suffix, spec, latest_df = df) {
   dated  <- file.path(output_dir, paste0(Sys.Date(), "-", spec$slug, slug_suffix, ".csv"))
   latest <- file.path(output_dir, paste0(spec$slug, slug_suffix, "-latest.csv"))
   write_csv(df, dated)
-  write_csv(df, latest)
+  write_csv(latest_df, latest)
   list(dated = dated, latest = latest)
 }
 
@@ -407,6 +454,24 @@ for (spec in rsv_targets) {
   if (nrow(snapshot) == 0) {
     warning(spec$label, ": no rows for target '", spec$target, "' at as_of ",
             resolved_as_of, " -- skipping.")
+    next
+  }
+
+  missing_observations <- sum(is.na(snapshot$value))
+  if (missing_observations > 0) {
+    message(
+      spec$label, ": dropping ", missing_observations,
+      " source row(s) with no observed value."
+    )
+    snapshot <- snapshot |>
+      filter(!is.na(value))
+  }
+
+  if (nrow(snapshot) == 0) {
+    warning(
+      spec$label, ": every row at as_of ", resolved_as_of,
+      " has a missing observation -- skipping."
+    )
     next
   }
 
@@ -448,7 +513,13 @@ for (spec in rsv_targets) {
     }
   }
 
-  target_paths <- write_pair(formatted, "", spec)
+  latest_formatted <- formatted
+  if (!is.null(spec$latest_start_date)) {
+    latest_formatted <- formatted |>
+      filter(date >= spec$latest_start_date)
+  }
+
+  target_paths <- write_pair(formatted, "", spec, latest_df = latest_formatted)
 
   present_groups <- sort(unique(formatted$target_group))
 
@@ -467,9 +538,12 @@ for (spec in rsv_targets) {
   spatial_groups <- setdiff(present_groups, national_target_group)
 
   message(
-    spec$label, ": wrote ", nrow(formatted), " rows, ", length(present_groups),
-    " target groups, ", min(formatted$date), " to ", max(formatted$date), ", to:\n  ",
-    target_paths$dated, "\n  ", target_paths$latest
+    spec$label, ": wrote full snapshot (", nrow(formatted), " rows, ",
+    min(formatted$date), " to ", max(formatted$date), ") to:\n  ",
+    target_paths$dated, "\n",
+    "  latest (", nrow(latest_formatted), " rows, ",
+    min(latest_formatted$date), " to ", max(latest_formatted$date), ") to:\n  ",
+    target_paths$latest
   )
 
   # -- neighbor graph, computed from the boundaries --------------------------
